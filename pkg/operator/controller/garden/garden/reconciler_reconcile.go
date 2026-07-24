@@ -462,6 +462,36 @@ func (r *Reconciler) reconcile(
 			Dependencies: flow.NewTaskIDs(waitUntilGardenerAPIServerReady),
 		})
 
+		generateAndReplicateGlobalObservabilityIngressPassword = g.Add(flow.Task{
+			Name: "Generating and replicating global observability ingress password",
+			Fn: func(ctx context.Context) error {
+				// TODO(vicwicker): Remove migration after Gardener v1.150 has been released.
+				if err := r.prepareGlobalMonitoringSecretMigration(ctx, virtualClusterClient); err != nil {
+					return err
+				}
+
+				secret, err := r.generateGlobalObservabilityIngressPassword(ctx, secretsManager)
+				if err != nil {
+					return fmt.Errorf("failed to generate global observability ingress secret: %w", err)
+				}
+
+				_, err = gardenerutils.ReplicateGlobalMonitoringSecret(ctx, virtualClusterClient, secret, r.GardenNamespace, func(name string) string {
+					return strings.TrimPrefix(name, "global-")
+				})
+				if err != nil {
+					return fmt.Errorf("failed to replicate global observability ingress secret to virtual garden cluster: %w", err)
+				}
+
+				// TODO(vicwicker): Remove migration after Gardener v1.150 has been released.
+				if err := r.finalizeGlobalMonitoringSecretMigration(ctx); err != nil {
+					return err
+				}
+
+				return nil
+			},
+			Dependencies: flow.NewTaskIDs(initializeVirtualClusterClient),
+		})
+
 		// Renew seed secrets tasks must run sequentially. They all use "gardener.cloud/operation" annotation of the seeds and there can be only one annotation at the same time.
 
 		// Functions that check if credentials rotations have completed are relatively fast as they just
@@ -509,13 +539,21 @@ func (r *Reconciler) reconcile(
 			SkipIf:       helper.GetCARotationPhase(garden.Status.Credentials) != gardencorev1beta1.RotationPreparing,
 			Dependencies: flow.NewTaskIDs(checkIfWorkloadIdentityTokensRenewalCompletedInAllSeeds),
 		})
-		_ = g.Add(flow.Task{
+		checkIfGardenletKubeconfigRenewalCompletedInAllSeeds = g.Add(flow.Task{
 			Name: "Check if all seeds finished the renewal of their gardenlet kubeconfig",
 			Fn: flow.TaskFn(func(ctx context.Context) error {
 				return secretsrotation.CheckIfGardenSecretsRenewalCompletedInAllSeeds(ctx, virtualClusterClient, v1beta1constants.GardenerOperationRenewKubeconfig, secretsTypeGardenletKubeconfig)
 			}).RetryUntilTimeout(defaultInterval, 10*time.Minute),
 			SkipIf:       helper.GetCARotationPhase(garden.Status.Credentials) != gardencorev1beta1.RotationPreparing,
 			Dependencies: flow.NewTaskIDs(renewGardenletKubeconfigInAllSeeds),
+		})
+		_ = g.Add(flow.Task{
+			Name: "Annotate seeds to trigger reconciliation after observability credentials rotation",
+			Fn: flow.TaskFn(func(ctx context.Context) error {
+				return secretsrotation.RenewGardenSecretsInAllSeeds(ctx, log, virtualClusterClient, v1beta1constants.GardenerOperationReconcile)
+			}).RetryUntilTimeout(defaultInterval, 10*time.Minute),
+			SkipIf:       !helper.IsObservabilityRotationInitiationTimeAfterLastCompletionTime(garden.Status.Credentials),
+			Dependencies: flow.NewTaskIDs(generateAndReplicateGlobalObservabilityIngressPassword, checkIfGardenletKubeconfigRenewalCompletedInAllSeeds),
 		})
 
 		rewriteResourcesAddLabel = g.Add(flow.Task{
@@ -644,9 +682,9 @@ func (r *Reconciler) reconcile(
 				}
 				discoveryServerEnabled := garden.Spec.VirtualCluster.Gardener.DiscoveryServer != nil
 				dashboardDomain := helper.PrimaryDashboardDomain(garden)
-				return r.deployGardenPrometheus(ctx, log, secretsManager, c.prometheusGarden, virtualClusterClient, aggregatePrometheusHost, dashboardDomain, discoveryServerEnabled)
+				return r.deployGardenPrometheus(ctx, secretsManager, c.prometheusGarden, virtualClusterClient, aggregatePrometheusHost, dashboardDomain, discoveryServerEnabled)
 			},
-			Dependencies: flow.NewTaskIDs(waitUntilGardenerAPIServerReady, initializeVirtualClusterClient),
+			Dependencies: flow.NewTaskIDs(waitUntilGardenerAPIServerReady, initializeVirtualClusterClient, generateAndReplicateGlobalObservabilityIngressPassword),
 		})
 		waitUntilPrometheusGardenReady = g.Add(flow.Task{
 			Name:         "Waiting until Garden Prometheus is ready",
@@ -1098,7 +1136,7 @@ func (r *Reconciler) deployGardenerAPIServerFunc(garden *operatorv1alpha1.Garden
 	}
 }
 
-func (r *Reconciler) deployGardenPrometheus(ctx context.Context, log logr.Logger, secretsManager secretsmanager.Interface, prometheus prometheus.Interface, virtualGardenClient client.Client, aggregatePrometheusHost string, dashboardDomain string, discoveryServerEnabled bool) error {
+func (r *Reconciler) deployGardenPrometheus(ctx context.Context, secretsManager secretsmanager.Interface, prometheus prometheus.Interface, virtualGardenClient client.Client, aggregatePrometheusHost string, dashboardDomain string, discoveryServerEnabled bool) error {
 	if err := gardenerutils.NewShootAccessSecret(gardenprometheus.AccessSecretName, r.GardenNamespace).Reconcile(ctx, r.RuntimeClientSet.Client()); err != nil {
 		return fmt.Errorf("failed reconciling access secret for garden prometheus: %w", err)
 	}
@@ -1111,24 +1149,12 @@ func (r *Reconciler) deployGardenPrometheus(ctx context.Context, log logr.Logger
 	prometheus.SetIngressAuthSecret(credentialsSecret)
 
 	// fetch global monitoring secret for prometheus-aggregate scrape config
-	secretList := &corev1.SecretList{}
-	if err := virtualGardenClient.List(ctx, secretList, client.InNamespace(r.GardenNamespace), client.MatchingLabels{v1beta1constants.GardenRole: v1beta1constants.GardenRoleGlobalMonitoring}); err != nil {
-		return fmt.Errorf("failed listing secrets in virtual garden for looking up global monitoring secret: %w", err)
+	globalMonitoringSecretRuntime, err := r.getGlobalObservabilitySecret(ctx)
+	if err != nil {
+		return err
 	}
-
-	var (
-		globalMonitoringSecretRuntime *corev1.Secret
-		err                           error
-	)
-
-	if len(secretList.Items) > 0 {
-		globalMonitoringSecret := &secretList.Items[0]
-
-		log.Info("Replicating global monitoring secret to garden namespace in runtime cluster", "secret", client.ObjectKeyFromObject(globalMonitoringSecret))
-		globalMonitoringSecretRuntime, err = gardenerutils.ReplicateGlobalMonitoringSecret(ctx, r.RuntimeClientSet.Client(), "global-", r.GardenNamespace, globalMonitoringSecret)
-		if err != nil {
-			return err
-		}
+	if globalMonitoringSecretRuntime == nil {
+		return fmt.Errorf("no global observability secret found in runtime cluster")
 	}
 
 	// fetch ingress urls of reachable seeds for prometheus-aggregate scrape config
